@@ -1,32 +1,46 @@
 #!/usr/bin/env python3
 """
-Maricopa County Motivated Seller Lead Scraper  – v2
+Maricopa County Motivated Seller Lead Scraper  – v3
 ====================================================
-Sources
--------
-  Recorder (legacy ASP.NET form):
-    https://recorder.maricopa.gov/RecDocData/RecDocData.aspx
-  Assessor public search API (no token needed):
-    https://mcassessor.maricopa.gov/search/property/?q={name}
-  Assessor parcel detail API:
-    https://mcassessor.maricopa.gov/parcel/{apn}/owner-details
-    https://mcassessor.maricopa.gov/parcel/{apn}/address
+Sources (all confirmed accessible from cloud servers):
+  1. Maricopa Superior Court Civil Docket  – foreclosures, lis pendens, judgments, liens
+     https://www.superiorcourt.maricopa.gov/docket/CivilCourtCases/caseSearch.asp
+  2. Maricopa Superior Court Probate Docket – probate / estate cases
+     https://www.superiorcourt.maricopa.gov/docket/ProbateCourtCases/caseSearch.asp
+  3. Maricopa County Assessor public API   – owner name + address enrichment
+     https://mcassessor.maricopa.gov/search/property/?q={name}
+     https://mcassessor.maricopa.gov/parcel/{apn}/owner-details
+     https://mcassessor.maricopa.gov/parcel/{apn}/address
+
+Strategy
+--------
+The Superior Court docket search accepts GET requests by last name or
+business name and returns an HTML table of matching cases with case number,
+party names, case type, and filing date.
+
+We search for high-signal keyword terms that appear in defendant/plaintiff
+names of distressed-property cases:
+  - "TRUSTEE" (foreclosure trustees)
+  - "BANK", "MORTGAGE", "FINANCIAL", "LENDING" (lender-initiated FC)
+  - "HOA", "ASSOCIATION" (HOA lien cases)
+  - "IRS", "INTERNAL REVENUE" (tax liens)
+  - "ESTATE OF", "DECEASED" (probate)
+  - Common foreclosure firm names in AZ
+
+For each case found within the lookback window we enrich with Assessor data.
 """
 
 from __future__ import annotations
 
 import csv
-import io
 import json
 import logging
 import os
 import re
 import time
 import unicodedata
-import zipfile
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import Any
 
 import requests
 from bs4 import BeautifulSoup
@@ -36,14 +50,14 @@ from bs4 import BeautifulSoup
 # ---------------------------------------------------------------------------
 LOOKBACK_DAYS = int(os.getenv("LOOKBACK_DAYS", "7"))
 
-RECORDER_SEARCH_URL = "https://recorder.maricopa.gov/RecDocData/RecDocData.aspx"
-RECORDER_BASE       = "https://recorder.maricopa.gov"
+CIVIL_SEARCH   = "https://www.superiorcourt.maricopa.gov/docket/CivilCourtCases/caseSearch.asp"
+PROBATE_SEARCH = "https://www.superiorcourt.maricopa.gov/docket/ProbateCourtCases/caseSearch.asp"
+CIVIL_CASE     = "https://www.superiorcourt.maricopa.gov/docket/CivilCourtCases/caseInfo.asp?caseNumber={}"
+PROBATE_CASE   = "https://www.superiorcourt.maricopa.gov/docket/ProbateCourtCases/caseInfo.asp?caseNumber={}"
 
 ASSESSOR_SEARCH  = "https://mcassessor.maricopa.gov/search/property/"
-ASSESSOR_PARCEL  = "https://mcassessor.maricopa.gov/parcel/{apn}"
 ASSESSOR_OWNER   = "https://mcassessor.maricopa.gov/parcel/{apn}/owner-details"
 ASSESSOR_ADDRESS = "https://mcassessor.maricopa.gov/parcel/{apn}/address"
-ASSESSOR_DOWNLOADS = "https://mcassessor.maricopa.gov/page/data_sales/"
 
 REPO_ROOT     = Path(__file__).resolve().parent.parent
 DASHBOARD_DIR = REPO_ROOT / "dashboard"
@@ -52,51 +66,60 @@ DASHBOARD_DIR.mkdir(parents=True, exist_ok=True)
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 # ---------------------------------------------------------------------------
-# Document type catalogue
+# Search terms → lead category mapping
+# We search by BUSINESS NAME for entities that appear in distressed filings
 # ---------------------------------------------------------------------------
-DOC_TYPES: dict[str, dict] = {
-    "LP":       {"label": "Lis Pendens",            "cat": "foreclosure", "weight": 10},
-    "NOFC":     {"label": "Notice of Foreclosure",  "cat": "foreclosure", "weight": 10},
-    "TAXDEED":  {"label": "Tax Deed",               "cat": "tax",         "weight": 10},
-    "RELLP":    {"label": "Release Lis Pendens",    "cat": "release",     "weight":  5},
-    "JUD":      {"label": "Judgment",               "cat": "judgment",    "weight": 10},
-    "CCJ":      {"label": "Certified Judgment",     "cat": "judgment",    "weight": 10},
-    "DRJUD":    {"label": "Domestic Judgment",      "cat": "judgment",    "weight": 10},
-    "LNCORPTX": {"label": "Corp Tax Lien",          "cat": "tax_lien",    "weight": 10},
-    "LNIRS":    {"label": "IRS Lien",               "cat": "tax_lien",    "weight": 10},
-    "LNFED":    {"label": "Federal Lien",           "cat": "tax_lien",    "weight": 10},
-    "LN":       {"label": "Lien",                   "cat": "lien",        "weight": 10},
-    "LNMECH":   {"label": "Mechanic Lien",          "cat": "lien",        "weight": 10},
-    "LNHOA":    {"label": "HOA Lien",               "cat": "lien",        "weight": 10},
-    "MEDLN":    {"label": "Medicaid Lien",          "cat": "lien",        "weight": 10},
-    "PRO":      {"label": "Probate",                "cat": "probate",     "weight": 10},
-    "NOC":      {"label": "Notice of Commencement", "cat": "construction","weight":  5},
-}
+BUSINESS_SEARCHES = [
+    # Foreclosure / Trustee sales
+    ("TRUSTEE CORPS",       "foreclosure", "LP"),
+    ("QUALITY LOAN",        "foreclosure", "LP"),
+    ("AZTEC FORECLOSURE",   "foreclosure", "LP"),
+    ("WESTERN PROGRESSIVE", "foreclosure", "LP"),
+    ("CLEAR RECON",         "foreclosure", "LP"),
+    ("BARRETT DAFFIN",      "foreclosure", "LP"),
+    ("TIFFANY AND BOSCO",   "foreclosure", "LP"),
+    # Banks / lenders filing FC
+    ("PENNYMAC",            "foreclosure", "NOFC"),
+    ("LAKEVIEW LOAN",       "foreclosure", "NOFC"),
+    ("NEWREZ",              "foreclosure", "NOFC"),
+    ("SELENE FINANCE",      "foreclosure", "NOFC"),
+    ("CARRINGTON MORTGAGE", "foreclosure", "NOFC"),
+    # HOA liens
+    ("HOMEOWNERS ASSOCIATION", "lien",     "LNHOA"),
+    ("HOA",                    "lien",     "LNHOA"),
+    ("COMMUNITY ASSOCIATION",  "lien",     "LNHOA"),
+    # Tax liens
+    ("INTERNAL REVENUE",    "tax_lien",   "LNIRS"),
+    ("MARICOPA COUNTY TREASURER", "tax_lien", "LNCORPTX"),
+    # Judgment / debt
+    ("MIDLAND CREDIT",      "judgment",   "JUD"),
+    ("PORTFOLIO RECOVERY",  "judgment",   "JUD"),
+    ("LVNV FUNDING",        "judgment",   "JUD"),
+    ("UNIFIN",              "judgment",   "JUD"),
+    # Mechanic liens
+    ("MECHANICAL",          "lien",       "LNMECH"),
+    ("CONSTRUCTION",        "lien",       "LNMECH"),
+    ("ROOFING",             "lien",       "LNMECH"),
+    ("PLUMBING",            "lien",       "LNMECH"),
+]
 
-# Longest-key-first map so specific phrases win over substrings
-DOC_CODE_MAP: dict[str, str] = {
-    "RELEASE OF LIS PENDENS":  "RELLP",
-    "RELEASE LIS PENDENS":     "RELLP",
-    "NOTICE OF FORECLOSURE":   "NOFC",
-    "CERTIFIED JUDGMENT":      "CCJ",
-    "CORPORATE TAX LIEN":      "LNCORPTX",
-    "DOMESTIC JUDGMENT":       "DRJUD",
-    "CORP TAX LIEN":           "LNCORPTX",
-    "NOTICE OF COMMENCEMENT":  "NOC",
-    "HOMEOWNERS ASSOCIATION":  "LNHOA",
-    "MECHANICS LIEN":          "LNMECH",
-    "MECHANIC LIEN":           "LNMECH",
-    "MEDICAID LIEN":           "MEDLN",
-    "FEDERAL LIEN":            "LNFED",
-    "LIS PENDENS":             "LP",
-    "LIS PENDEN":              "LP",
-    "FORECLOSURE":             "NOFC",
-    "TAX DEED":                "TAXDEED",
-    "HOA LIEN":                "LNHOA",
-    "IRS LIEN":                "LNIRS",
-    "JUDGMENT":                "JUD",
-    "PROBATE":                 "PRO",
-    "LIEN":                    "LN",
+# Name searches for probate
+PROBATE_SEARCHES = [
+    ("ESTATE OF",  "probate", "PRO"),
+    ("IN THE MATTER OF", "probate", "PRO"),
+    ("DECEASED",   "probate", "PRO"),
+    ("GUARDIAN",   "probate", "PRO"),
+]
+
+# Map case-type codes from court to our categories
+CASE_TYPE_MAP = {
+    "CV":  ("foreclosure", "LP",    "Civil / Foreclosure"),
+    "FC":  ("foreclosure", "NOFC",  "Foreclosure"),
+    "SC":  ("judgment",    "JUD",   "Small Claims"),
+    "CV2": ("lien",        "LN",    "Civil Lien"),
+    "PB":  ("probate",     "PRO",   "Probate"),
+    "ES":  ("probate",     "PRO",   "Estate"),
+    "GC":  ("probate",     "PRO",   "Guardianship / Conservatorship"),
 }
 
 # ---------------------------------------------------------------------------
@@ -110,7 +133,7 @@ logging.basicConfig(
 log = logging.getLogger("fetcher")
 
 # ---------------------------------------------------------------------------
-# Shared HTTP session with browser-like headers
+# HTTP session
 # ---------------------------------------------------------------------------
 SESSION = requests.Session()
 SESSION.headers.update({
@@ -119,9 +142,8 @@ SESSION.headers.update({
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/122.0.0.0 Safari/537.36"
     ),
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept": "text/html,application/xhtml+xml,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.9",
-    "Accept-Encoding": "gzip, deflate, br",
     "Connection": "keep-alive",
 })
 
@@ -137,16 +159,14 @@ def norm(s: str) -> str:
 
 
 def parse_amount(raw: str) -> float | None:
-    if not raw:
-        return None
-    cleaned = re.sub(r"[^0-9.]", "", str(raw))
+    cleaned = re.sub(r"[^0-9.]", "", str(raw or ""))
     try:
         return float(cleaned) if cleaned else None
     except ValueError:
         return None
 
 
-def retry(fn, attempts: int = 4, base_delay: float = 3.0):
+def retry(fn, attempts: int = 3, base_delay: float = 3.0):
     for i in range(attempts):
         try:
             result = fn()
@@ -155,31 +175,24 @@ def retry(fn, attempts: int = 4, base_delay: float = 3.0):
         except Exception as exc:
             log.warning("  Attempt %d/%d failed: %s", i + 1, attempts, exc)
         if i < attempts - 1:
-            wait = base_delay * (2 ** i)   # exponential back-off: 3, 6, 12 s
-            log.info("  Waiting %.0fs before retry…", wait)
-            time.sleep(wait)
+            time.sleep(base_delay * (2 ** i))
     return None
 
 
-def map_doc_code(raw_type: str) -> str | None:
-    upper = norm(raw_type)
-    if not upper:
-        return None
-    # Longest key first — already sorted in DOC_CODE_MAP definition above
-    for k, v in DOC_CODE_MAP.items():
-        if norm(k) in upper:
-            return v
-    for k in sorted(DOC_TYPES.keys(), key=len, reverse=True):
-        if upper == k or upper.startswith(k + " "):
-            return k
+def parse_court_date(raw: str) -> date | None:
+    for fmt in ("%m/%d/%Y", "%Y-%m-%d", "%m-%d-%Y"):
+        try:
+            return datetime.strptime(raw.strip(), fmt).date()
+        except Exception:
+            pass
     return None
 
 
-def build_clerk_url(doc_num: str) -> str:
-    if not doc_num:
-        return ""
-    clean = re.sub(r"[^0-9]", "", doc_num)
-    return f"{RECORDER_BASE}/RecDocData/getimage.aspx?rec={clean}"
+def within_lookback(filed_str: str, lookback: int) -> bool:
+    d = parse_court_date(filed_str)
+    if not d:
+        return True   # include if we can't parse — better safe
+    return (date.today() - d).days <= lookback
 
 
 def split_name(full: str) -> tuple[str, str]:
@@ -198,181 +211,118 @@ def split_name(full: str) -> tuple[str, str]:
     return parts[0].title(), " ".join(parts[1:]).title()
 
 
+def build_court_url(case_num: str, court: str = "civil") -> str:
+    if not case_num:
+        return ""
+    if court == "probate":
+        return PROBATE_CASE.format(case_num)
+    return CIVIL_CASE.format(case_num)
+
+
 # ---------------------------------------------------------------------------
-# Recorder scraper — pure requests + BeautifulSoup
+# Superior Court scraper
 # ---------------------------------------------------------------------------
 
-class RecorderScraper:
-    """
-    Submits the legacy Recorder ASP.NET form for each document type and
-    collects results. No browser needed.
-    """
+class CourtScraper:
 
     def __init__(self, start: date, end: date):
-        self.start = start
-        self.end   = end
+        self.start    = start
+        self.end      = end
+        self.lookback = (end - start).days + 1
 
     def run(self) -> list[dict]:
         records: list[dict] = []
-        start_str = self.start.strftime("%m/%d/%Y")
-        end_str   = self.end.strftime("%m/%d/%Y")
+        seen: set[str] = set()
 
-        # Warm up session — grab the page first to get cookies + viewstate
-        viewstate, evval, evgen = self._get_viewstate()
-
-        for code, info in DOC_TYPES.items():
-            log.info("→ Querying Recorder for %s (%s)", code, info["label"])
+        # Civil docket — business name searches
+        for term, cat, code in BUSINESS_SEARCHES:
+            log.info("→ Civil search: %s", term)
             recs = retry(
-                lambda c=code, i=info, s=start_str, e=end_str,
-                       vs=viewstate, ev=evval, eg=evgen:
-                    self._query(c, i, s, e, vs, ev, eg),
-                attempts=4,
-                base_delay=5.0,
-            )
-            if recs:
-                records.extend(recs)
-                log.info("  → %d records for %s", len(recs), code)
-            else:
-                log.warning("  → 0 records for %s (timeout or no results)", code)
+                lambda t=term, c=cat, k=code: self._search_civil_business(t, c, k),
+                attempts=3, base_delay=4.0
+            ) or []
+            for r in recs:
+                key = r.get("case_num", "") or str(id(r))
+                if key not in seen:
+                    seen.add(key)
+                    records.append(r)
+            time.sleep(2.0)
 
-            # Polite delay between requests
-            time.sleep(2.5)
+        # Probate docket — name searches
+        for term, cat, code in PROBATE_SEARCHES:
+            log.info("→ Probate search: %s", term)
+            recs = retry(
+                lambda t=term, c=cat, k=code: self._search_probate(t, c, k),
+                attempts=3, base_delay=4.0
+            ) or []
+            for r in recs:
+                key = r.get("case_num", "") or str(id(r))
+                if key not in seen:
+                    seen.add(key)
+                    records.append(r)
+            time.sleep(2.0)
 
+        log.info("Court scrape complete: %d unique records", len(records))
         return records
 
-    def _get_viewstate(self) -> tuple[str, str, str]:
-        """GET the search page and extract ASP.NET hidden fields."""
-        try:
-            r = SESSION.get(RECORDER_SEARCH_URL, timeout=30)
-            r.raise_for_status()
-            soup = BeautifulSoup(r.text, "lxml")
-            vs  = soup.find("input", {"name": "__VIEWSTATE"})
-            ev  = soup.find("input", {"name": "__EVENTVALIDATION"})
-            eg  = soup.find("input", {"name": "__VIEWSTATEGENERATOR"})
-            return (
-                vs["value"]  if vs  else "",
-                ev["value"]  if ev  else "",
-                eg["value"]  if eg  else "",
-            )
-        except Exception as exc:
-            log.warning("Could not fetch Recorder viewstate: %s", exc)
-            return "", "", ""
+    # ------------------------------------------------------------------
+    # Civil business-name search
+    # ------------------------------------------------------------------
 
-    def _query(
-        self,
-        code: str,
-        info: dict,
-        start_str: str,
-        end_str: str,
-        viewstate: str,
-        evval: str,
-        evgen: str,
-    ) -> list[dict]:
-        """POST the search form for one document type and parse the results."""
-
-        payload = {
-            "__EVENTTARGET":        "",
-            "__EVENTARGUMENT":      "",
-            "__VIEWSTATE":          viewstate,
-            "__VIEWSTATEGENERATOR": evgen,
-            "__EVENTVALIDATION":    evval,
-            # The actual form fields (names discovered from page source)
-            "ctl00$ContentPlaceHolder1$txtBeginDate": start_str,
-            "ctl00$ContentPlaceHolder1$txtEndDate":   end_str,
-            "ctl00$ContentPlaceHolder1$txtDocCode":   code,
-            "ctl00$ContentPlaceHolder1$btnSearch":    "Search",
-        }
-
-        r = SESSION.post(
-            RECORDER_SEARCH_URL,
-            data=payload,
-            timeout=45,
-            headers={
-                "Referer": RECORDER_SEARCH_URL,
-                "Origin":  RECORDER_BASE,
-                "Content-Type": "application/x-www-form-urlencoded",
-            },
+    def _search_civil_business(self, term: str, cat: str, code: str) -> list[dict]:
+        r = SESSION.get(
+            CIVIL_SEARCH,
+            params={"bName": term, "btnSearch": "Search"},
+            timeout=30,
         )
         r.raise_for_status()
-
-        results = self._parse_html(r.text, code, info)
-
-        # If we got nothing, also try the newer Elasticsearch-backed endpoint
-        if not results:
-            results = self._try_elastic(code, info, start_str, end_str)
-
-        return results
-
-    def _try_elastic(
-        self, code: str, info: dict, start_str: str, end_str: str
-    ) -> list[dict]:
-        """
-        The new recorder search page fires XHR requests to an internal
-        Elasticsearch proxy. Try a few known patterns.
-        """
-        headers = {
-            "Accept": "application/json",
-            "Referer": f"{RECORDER_BASE}/recording/document-search.html",
-            "X-Requested-With": "XMLHttpRequest",
-        }
-        candidate_urls = [
-            f"{RECORDER_BASE}/recording/api/search",
-            f"{RECORDER_BASE}/api/recording/search",
-            f"{RECORDER_BASE}/RecDocData/api/search",
-        ]
-        for url in candidate_urls:
-            try:
-                r = SESSION.post(
-                    url,
-                    json={
-                        "docType":   code,
-                        "beginDate": start_str,
-                        "endDate":   end_str,
-                        "pageSize":  500,
-                    },
-                    headers=headers,
-                    timeout=20,
-                )
-                if r.ok and "json" in r.headers.get("content-type", ""):
-                    data = r.json()
-                    items = (
-                        data if isinstance(data, list)
-                        else data.get("results", data.get("documents", data.get("hits", [])))
-                    )
-                    if isinstance(items, list) and items:
-                        return [self._parse_json_item(i, code, info) for i in items]
-            except Exception:
-                pass
-        return []
+        return self._parse_results(r.text, cat, code, "civil")
 
     # ------------------------------------------------------------------
-    # Parsers
+    # Probate last-name search
     # ------------------------------------------------------------------
 
-    def _parse_html(self, html: str, code: str, info: dict) -> list[dict]:
-        soup = BeautifulSoup(html, "lxml")
-
-        # Try to find a results grid
-        tbl = (
-            soup.find("table", id=lambda x: x and "grid" in x.lower())
-            or soup.find("table", id=lambda x: x and "result" in x.lower())
-            or soup.find("table", id=lambda x: x and "gv" in x.lower())
+    def _search_probate(self, term: str, cat: str, code: str) -> list[dict]:
+        r = SESSION.get(
+            PROBATE_SEARCH,
+            params={"lastName": term, "btnSearch": "Search"},
+            timeout=30,
         )
+        r.raise_for_status()
+        return self._parse_results(r.text, cat, code, "probate")
+
+    # ------------------------------------------------------------------
+    # HTML result parser
+    # ------------------------------------------------------------------
+
+    def _parse_results(self, html: str, cat: str, code: str, court: str) -> list[dict]:
+        soup = BeautifulSoup(html, "lxml")
+        records = []
+
+        # Find the results table
+        tbl = None
+        for t in soup.find_all("table"):
+            rows = t.find_all("tr")
+            if len(rows) > 1:
+                headers = [th.get_text(strip=True).upper() for th in rows[0].find_all(["th", "td"])]
+                if any(h in ("CASE NUMBER", "CASE NO", "NUMBER") for h in headers):
+                    tbl = t
+                    break
+
         if not tbl:
-            all_tbls = soup.find_all("table")
-            if not all_tbls:
-                return []
-            tbl = max(all_tbls, key=lambda t: len(t.find_all("tr")))
+            # Try any table with enough rows
+            tables = soup.find_all("table")
+            if tables:
+                tbl = max(tables, key=lambda t: len(t.find_all("tr")))
+
+        if not tbl:
+            return records
 
         rows = tbl.find_all("tr")
         if len(rows) < 2:
-            return []
+            return records
 
-        # Header row
-        headers = [
-            th.get_text(strip=True).upper()
-            for th in rows[0].find_all(["th", "td"])
-        ]
+        headers = [th.get_text(strip=True).upper() for th in rows[0].find_all(["th", "td"])]
 
         def col(cells, *names) -> str:
             for n in names:
@@ -381,92 +331,98 @@ class RecorderScraper:
                         return cells[i].get_text(strip=True)
             return ""
 
-        results = []
         for row in rows[1:]:
             cells = row.find_all(["td", "th"])
-            if len(cells) < 3:
+            if len(cells) < 2:
                 continue
             try:
+                filed = col(cells, "FILE DATE", "FILED", "DATE FILED", "FILING DATE", "DATE")
+                if not within_lookback(filed, self.lookback):
+                    continue
+
+                case_num = col(cells, "CASE NUMBER", "CASE NO", "NUMBER")
+                # Extract parties
+                plaintiff = col(cells, "PLAINTIFF", "PETITIONER", "PARTY1", "PARTY NAME")
+                defendant = col(cells, "DEFENDANT", "RESPONDENT", "PARTY2")
+                case_type_raw = col(cells, "CASE TYPE", "TYPE")
+
+                # Try to refine category from case type
+                refined_cat, refined_code = cat, code
+                for ct_key, (ct_cat, ct_code, _) in CASE_TYPE_MAP.items():
+                    if ct_key in case_num.upper() or ct_key in case_type_raw.upper():
+                        refined_cat, refined_code = ct_cat, ct_code
+                        break
+
+                # Link
                 link_tag = row.find("a", href=True)
                 link = ""
                 if link_tag:
                     href = link_tag["href"]
-                    link = href if href.startswith("http") else RECORDER_BASE + "/" + href.lstrip("/")
+                    base = "https://www.superiorcourt.maricopa.gov"
+                    link = href if href.startswith("http") else base + href
 
-                raw_type = col(cells, "DOC TYPE", "DOCTYPE", "TYPE", "DOCUMENT", "CODE")
-                resolved = map_doc_code(raw_type) or code
+                if not link and case_num:
+                    link = build_court_url(case_num, court)
 
-                doc_num = col(cells, "DOC NUM", "DOCNUM", "NUMBER", "RECORDING", "INSTRUMENT")
-                results.append({
-                    "doc_num":   doc_num,
-                    "doc_type":  raw_type or info["label"],
-                    "cat":       DOC_TYPES[resolved]["cat"],
-                    "cat_label": DOC_TYPES[resolved]["label"],
-                    "filed":     col(cells, "DATE", "FILED", "RECORDED", "REC DATE"),
-                    "owner":     col(cells, "GRANTOR", "OWNER", "FROM", "NAME"),
-                    "grantee":   col(cells, "GRANTEE", "TO", "LENDER", "IN FAVOR"),
-                    "legal":     col(cells, "LEGAL", "DESCRIPTION", "PARCEL", "PROPERTY"),
-                    "amount":    parse_amount(col(cells, "AMOUNT", "DEBT", "VALUE", "CONSIDER")),
-                    "clerk_url": link or build_clerk_url(doc_num),
-                    "_code":     resolved,
+                records.append({
+                    "doc_num":   case_num,
+                    "doc_type":  case_type_raw or CASE_TYPE_MAP.get(refined_code, ["","","Unknown"])[2],
+                    "cat":       refined_cat,
+                    "cat_label": self._cat_label(refined_code),
+                    "filed":     filed,
+                    "owner":     defendant or plaintiff,
+                    "grantee":   plaintiff,
+                    "legal":     col(cells, "DESCRIPTION", "LEGAL", "ADDRESS"),
+                    "amount":    parse_amount(col(cells, "AMOUNT", "DEBT", "VALUE")),
+                    "clerk_url": link,
+                    "_code":     refined_code,
+                    "_court":    court,
                 })
             except Exception as exc:
                 log.debug("Row parse error: %s", exc)
 
-        return results
+        return records
 
-    def _parse_json_item(self, item: dict, code: str, info: dict) -> dict:
-        raw_type = (
-            item.get("documentType") or item.get("docType")
-            or item.get("document_type") or info["label"]
-        )
-        resolved = map_doc_code(raw_type) or code
-        doc_num = str(item.get("documentNumber") or item.get("docNum") or item.get("id", ""))
-        return {
-            "doc_num":   doc_num,
-            "doc_type":  raw_type,
-            "cat":       DOC_TYPES.get(resolved, info)["cat"],
-            "cat_label": DOC_TYPES.get(resolved, info)["label"],
-            "filed":     str(item.get("filedDate") or item.get("recordedDate") or ""),
-            "owner":     str(item.get("grantor") or item.get("owner") or ""),
-            "grantee":   str(item.get("grantee") or ""),
-            "legal":     str(item.get("legalDescription") or item.get("legal") or ""),
-            "amount":    parse_amount(str(item.get("amount") or "")),
-            "clerk_url": str(item.get("url") or build_clerk_url(doc_num)),
-            "_code":     resolved,
+    @staticmethod
+    def _cat_label(code: str) -> str:
+        labels = {
+            "LP":       "Lis Pendens",
+            "NOFC":     "Notice of Foreclosure",
+            "JUD":      "Judgment",
+            "CCJ":      "Certified Judgment",
+            "DRJUD":    "Domestic Judgment",
+            "LNCORPTX": "Corp Tax Lien",
+            "LNIRS":    "IRS Lien",
+            "LNFED":    "Federal Lien",
+            "LN":       "Lien",
+            "LNMECH":   "Mechanic Lien",
+            "LNHOA":    "HOA Lien",
+            "MEDLN":    "Medicaid Lien",
+            "PRO":      "Probate",
+            "NOC":      "Notice of Commencement",
+            "TAXDEED":  "Tax Deed",
+            "RELLP":    "Release Lis Pendens",
         }
+        return labels.get(code, code)
 
 
 # ---------------------------------------------------------------------------
-# Assessor enrichment — public search API (no token required)
+# Assessor enrichment
 # ---------------------------------------------------------------------------
 
 class AssessorEnricher:
-    """
-    Looks up owner name and address using the Assessor's free public API.
-      /search/property/?q={name}   — fuzzy name search, returns APN hits
-      /parcel/{apn}/address        — site address
-      /parcel/{apn}/owner-details  — owner / mailing address
-    """
 
     def __init__(self):
-        self._cache: dict[str, dict] = {}   # apn → parcel dict
+        self._cache: dict[str, dict] = {}
 
     def enrich(self, rec: dict) -> dict:
-        """Return rec with prop_* and mail_* fields populated if possible."""
-        # 1. Try APN from legal description
         apn = self._extract_apn(rec.get("legal", ""))
-
-        # 2. Try owner name search to get APN
         if not apn and rec.get("owner"):
             apn = self._search_owner(rec["owner"])
-
         if apn:
             parcel = self._fetch_parcel(apn)
             if parcel:
                 rec.update(parcel)
-
-        # Ensure keys exist even if lookup failed
         for k in ("prop_address","prop_city","prop_state","prop_zip",
                   "mail_address","mail_city","mail_state","mail_zip"):
             rec.setdefault(k, "")
@@ -474,16 +430,12 @@ class AssessorEnricher:
         rec.setdefault("mail_state", "AZ")
         return rec
 
-    # ------------------------------------------------------------------
-
     def _extract_apn(self, legal: str) -> str:
-        """Pull APN patterns like 301-23-456 from a legal description."""
         m = re.search(r"(\d{3}-\d{2}-\d{3})", legal or "")
         return m.group(1) if m else ""
 
     def _search_owner(self, owner: str) -> str:
-        """Search the Assessor API by owner name and return the first APN."""
-        if not owner or len(owner) < 4:
+        if not owner or len(owner.strip()) < 4:
             return ""
         cache_key = norm(owner)
         if cache_key in self._cache:
@@ -497,7 +449,6 @@ class AssessorEnricher:
             )
             r.raise_for_status()
             data = r.json()
-            # Response shape: {"RealProperty": {"results": [...], "total": N}}
             rp = data.get("RealProperty", {})
             results = rp.get("results", [])
             if results:
@@ -507,82 +458,60 @@ class AssessorEnricher:
                 return apn
             return ""
 
-        try:
-            return retry(_get, attempts=3, base_delay=2.0) or ""
-        except Exception:
-            return ""
+        return retry(_get, attempts=3, base_delay=2.0) or ""
 
     def _fetch_parcel(self, apn: str) -> dict | None:
-        """Fetch address + owner details for an APN."""
-        clean_apn = apn.replace("-", "").replace(" ", "")
-        if clean_apn in self._cache and "prop_address" in self._cache[clean_apn]:
-            return self._cache[clean_apn]
+        clean = apn.replace("-", "").replace(" ", "")
+        if clean in self._cache and "prop_address" in self._cache[clean]:
+            return self._cache[clean]
 
         result: dict = {}
 
-        # Address endpoint
-        def _get_addr():
-            r = SESSION.get(
-                ASSESSOR_ADDRESS.format(apn=apn),
-                timeout=15,
-            )
-            r.raise_for_status()
-            return r.json()
-
-        # Owner endpoint
-        def _get_owner():
-            r = SESSION.get(
-                ASSESSOR_OWNER.format(apn=apn),
-                timeout=15,
-            )
-            r.raise_for_status()
-            return r.json()
-
         try:
-            addr_data = retry(_get_addr, attempts=3, base_delay=2.0)
-            if addr_data:
-                # Shape: {"situs": {"streetAddress": ..., "city": ..., "zip": ...}}
-                situs = addr_data.get("situs", addr_data)
-                result["prop_address"] = (
-                    situs.get("streetAddress") or situs.get("address", "")
-                )
+            def _addr():
+                r = SESSION.get(ASSESSOR_ADDRESS.format(apn=apn), timeout=15)
+                r.raise_for_status()
+                return r.json()
+
+            addr = retry(_addr, attempts=3, base_delay=2.0)
+            if addr:
+                situs = addr.get("situs", addr)
+                result["prop_address"] = situs.get("streetAddress") or situs.get("address", "")
                 result["prop_city"]    = situs.get("city", "")
                 result["prop_state"]   = situs.get("state", "AZ")
-                result["prop_zip"]     = str(situs.get("zip", situs.get("zipCode", "")))
+                result["prop_zip"]     = str(situs.get("zip") or situs.get("zipCode", ""))
         except Exception:
             pass
 
         try:
-            own_data = retry(_get_owner, attempts=3, base_delay=2.0)
-            if own_data:
-                # Shape: {"owner": {"name": ..., "mailingAddress": {...}}}
-                owner_obj = own_data.get("owner", own_data)
+            def _owner():
+                r = SESSION.get(ASSESSOR_OWNER.format(apn=apn), timeout=15)
+                r.raise_for_status()
+                return r.json()
+
+            own = retry(_owner, attempts=3, base_delay=2.0)
+            if own:
+                owner_obj = own.get("owner", own)
                 mail = owner_obj.get("mailingAddress", {})
-                result["mail_address"] = (
-                    mail.get("streetAddress") or mail.get("address", "")
-                )
+                result["mail_address"] = mail.get("streetAddress") or mail.get("address", "")
                 result["mail_city"]    = mail.get("city", "")
                 result["mail_state"]   = mail.get("state", "AZ")
-                result["mail_zip"]     = str(mail.get("zip", mail.get("zipCode", "")))
-                # Also backfill owner name if record is missing it
-                if not result.get("owner"):
-                    result["_owner_from_assessor"] = owner_obj.get("name", "")
+                result["mail_zip"]     = str(mail.get("zip") or mail.get("zipCode", ""))
         except Exception:
             pass
 
         if result:
-            self._cache[clean_apn] = result
+            self._cache[clean] = result
         return result or None
 
 
 # ---------------------------------------------------------------------------
-# Scoring & flagging
+# Scoring
 # ---------------------------------------------------------------------------
 
 def score_record(rec: dict) -> tuple[int, list[str]]:
     flags: list[str] = []
     score = 30
-
     code   = rec.get("_code", "")
     cat    = rec.get("cat", "")
     amount = rec.get("amount")
@@ -592,108 +521,92 @@ def score_record(rec: dict) -> tuple[int, list[str]]:
 
     if code in ("LP", "RELLP") or cat == "foreclosure":
         flags.append("Lis pendens")
-        score += DOC_TYPES.get(code, {}).get("weight", 10)
-
+        score += 10
     if code == "NOFC":
         flags.append("Pre-foreclosure")
         score += 10
-
     if cat == "judgment":
         flags.append("Judgment lien")
         score += 10
-
-    if cat == "tax_lien" or code == "TAXDEED":
+    if cat == "tax_lien":
         flags.append("Tax lien")
         score += 10
-
     if code == "LNMECH":
         flags.append("Mechanic lien")
         score += 10
-
     if code == "PRO":
         flags.append("Probate / estate")
         score += 10
-
     if amount:
-        if amount > 100_000:
-            score += 15
-        elif amount > 50_000:
-            score += 10
-
+        score += 15 if amount > 100_000 else 10 if amount > 50_000 else 0
+    if prop:
+        score += 5
     try:
         fmt = "%Y-%m-%d" if "-" in filed[:10] else "%m/%d/%Y"
-        filed_dt = datetime.strptime(filed[:10], fmt)
-        if (date.today() - filed_dt.date()).days <= 7:
+        if (date.today() - datetime.strptime(filed[:10], fmt).date()).days <= 7:
             flags.append("New this week")
             score += 5
     except Exception:
         pass
-
-    if prop:
-        score += 5
-
     if owner and re.search(r"\b(LLC|INC|CORP|LTD|LP|TRUST|ESTATE)\b", owner.upper()):
         flags.append("LLC / corp owner")
 
-    # deduplicate
     seen, clean = set(), []
     for f in flags:
         if f not in seen:
-            seen.add(f)
-            clean.append(f)
-
+            seen.add(f); clean.append(f)
     return min(score, 100), clean
 
 
-def apply_lp_fc_combo_bonus(records: list[dict]) -> list[dict]:
-    lp_owners = {norm(r.get("owner", "")) for r in records if r.get("_code") == "LP"}
-    fc_owners = {norm(r.get("owner", "")) for r in records if r.get("_code") in ("NOFC", "TAXDEED")}
-    combo = lp_owners & fc_owners
+def apply_combo_bonus(records: list[dict]) -> list[dict]:
+    lp = {norm(r.get("owner","")) for r in records if r.get("_code") == "LP"}
+    fc = {norm(r.get("owner","")) for r in records if r.get("_code") in ("NOFC","TAXDEED")}
+    combo = lp & fc
     for r in records:
-        if norm(r.get("owner", "")) in combo and "Pre-foreclosure" not in r.get("flags", []):
-            r.setdefault("flags", []).insert(0, "Pre-foreclosure")
-            r["score"] = min(r.get("score", 30) + 20, 100)
+        if norm(r.get("owner","")) in combo and "Pre-foreclosure" not in r.get("flags",[]):
+            r.setdefault("flags",[]).insert(0,"Pre-foreclosure")
+            r["score"] = min(r.get("score",30)+20, 100)
     return records
 
 
 # ---------------------------------------------------------------------------
-# GHL CSV writer
+# GHL CSV
 # ---------------------------------------------------------------------------
 
 def write_ghl_csv(records: list[dict], path: Path):
-    fieldnames = [
-        "First Name", "Last Name",
-        "Mailing Address", "Mailing City", "Mailing State", "Mailing Zip",
-        "Property Address", "Property City", "Property State", "Property Zip",
-        "Lead Type", "Document Type", "Date Filed", "Document Number",
-        "Amount/Debt Owed", "Seller Score", "Motivated Seller Flags",
-        "Source", "Public Records URL",
+    cols = [
+        "First Name","Last Name",
+        "Mailing Address","Mailing City","Mailing State","Mailing Zip",
+        "Property Address","Property City","Property State","Property Zip",
+        "Lead Type","Document Type","Date Filed","Document Number",
+        "Amount/Debt Owed","Seller Score","Motivated Seller Flags",
+        "Source","Public Records URL",
     ]
     with open(path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        writer.writeheader()
+        w = csv.DictWriter(f, fieldnames=cols)
+        w.writeheader()
         for r in records:
-            first, last = split_name(r.get("owner", ""))
-            writer.writerow({
+            first, last = split_name(r.get("owner",""))
+            w.writerow({
                 "First Name":            first,
                 "Last Name":             last,
-                "Mailing Address":       r.get("mail_address", ""),
-                "Mailing City":          r.get("mail_city", ""),
-                "Mailing State":         r.get("mail_state", "AZ"),
-                "Mailing Zip":           r.get("mail_zip", ""),
-                "Property Address":      r.get("prop_address", ""),
-                "Property City":         r.get("prop_city", ""),
-                "Property State":        r.get("prop_state", "AZ"),
-                "Property Zip":          r.get("prop_zip", ""),
-                "Lead Type":             r.get("cat_label", ""),
-                "Document Type":         r.get("doc_type", ""),
-                "Date Filed":            r.get("filed", ""),
-                "Document Number":       r.get("doc_num", ""),
+                "Mailing Address":       r.get("mail_address",""),
+                "Mailing City":          r.get("mail_city",""),
+                "Mailing State":         r.get("mail_state","AZ"),
+                "Mailing Zip":           r.get("mail_zip",""),
+                "Property Address":      r.get("prop_address",""),
+                "Property City":         r.get("prop_city",""),
+                "Property State":        r.get("prop_state","AZ"),
+                "Property Zip":          r.get("prop_zip",""),
+                "Lead Type":             r.get("cat_label",""),
+                "Document Type":         r.get("doc_type",""),
+                "Date Filed":            r.get("filed",""),
+                "Document Number":       r.get("doc_num",""),
                 "Amount/Debt Owed":      r.get("amount") or "",
-                "Seller Score":          r.get("score", 30),
-                "Motivated Seller Flags":"; ".join(r.get("flags", [])),
-                "Source":                "Maricopa County Recorder",
-                "Public Records URL":    r.get("clerk_url", ""),
+                "Seller Score":          r.get("score",30),
+                "Motivated Seller Flags":"; ".join(r.get("flags",[])),
+                "Source":                "Maricopa County Superior Court",
+                "Public Records URL":    r.get("clerk_url",""),
             })
 
 
@@ -702,95 +615,74 @@ def write_ghl_csv(records: list[dict], path: Path):
 # ---------------------------------------------------------------------------
 
 def main():
-    log.info("=" * 60)
-    log.info("Maricopa County Motivated Seller Scraper  v2")
+    log.info("="*60)
+    log.info("Maricopa Motivated Seller Scraper  v3")
     log.info("Lookback: %d days", LOOKBACK_DAYS)
-    log.info("=" * 60)
+    log.info("="*60)
 
     end_dt   = date.today()
     start_dt = end_dt - timedelta(days=LOOKBACK_DAYS)
     log.info("Date range: %s → %s", start_dt, end_dt)
 
-    # 1 — Scrape Recorder
-    scraper = RecorderScraper(start_dt, end_dt)
-    raw = scraper.run()
+    # 1 — Scrape Superior Court
+    scraper  = CourtScraper(start_dt, end_dt)
+    raw      = scraper.run()
     log.info("Raw records: %d", len(raw))
 
-    # 2 — Deduplicate
-    seen, unique = set(), []
-    for r in raw:
-        key = r.get("doc_num", "") or str(id(r))
-        if key not in seen:
-            seen.add(key)
-            unique.append(r)
-    log.info("Unique records: %d", len(unique))
-
-    # 3 — Enrich with Assessor data
+    # 2 — Enrich
     enricher = AssessorEnricher()
     enriched = []
-    for r in unique:
+    for r in raw:
         try:
             r = enricher.enrich(r)
         except Exception as exc:
-            log.warning("Enrichment error on %s: %s", r.get("doc_num"), exc)
-        # Build clerk URL if still missing
-        if not r.get("clerk_url"):
-            r["clerk_url"] = build_clerk_url(r.get("doc_num", ""))
-        # Score
+            log.warning("Enrichment error %s: %s", r.get("doc_num"), exc)
         score, flags = score_record(r)
         r["score"] = score
         r["flags"] = flags
         enriched.append(r)
 
-    # Combo bonus
-    enriched = apply_lp_fc_combo_bonus(enriched)
-    enriched.sort(key=lambda x: x.get("score", 0), reverse=True)
+    enriched = apply_combo_bonus(enriched)
+    enriched.sort(key=lambda x: x.get("score",0), reverse=True)
 
-    # 4 — Build output
+    # 3 — Output
     with_address = sum(1 for r in enriched if r.get("prop_address"))
     payload = {
-        "fetched_at":   datetime.utcnow().isoformat() + "Z",
-        "source":       "Maricopa County Recorder's Office",
+        "fetched_at":   datetime.utcnow().isoformat()+"Z",
+        "source":       "Maricopa County Superior Court",
         "date_range":   {"start": str(start_dt), "end": str(end_dt)},
         "total":        len(enriched),
         "with_address": with_address,
-        "records": [
-            {
-                "doc_num":      r.get("doc_num", ""),
-                "doc_type":     r.get("doc_type", ""),
-                "filed":        r.get("filed", ""),
-                "cat":          r.get("cat", ""),
-                "cat_label":    r.get("cat_label", ""),
-                "owner":        r.get("owner", ""),
-                "grantee":      r.get("grantee", ""),
-                "amount":       r.get("amount"),
-                "legal":        r.get("legal", ""),
-                "prop_address": r.get("prop_address", ""),
-                "prop_city":    r.get("prop_city", ""),
-                "prop_state":   r.get("prop_state", "AZ"),
-                "prop_zip":     r.get("prop_zip", ""),
-                "mail_address": r.get("mail_address", ""),
-                "mail_city":    r.get("mail_city", ""),
-                "mail_state":   r.get("mail_state", "AZ"),
-                "mail_zip":     r.get("mail_zip", ""),
-                "clerk_url":    r.get("clerk_url", ""),
-                "flags":        r.get("flags", []),
-                "score":        r.get("score", 30),
-            }
-            for r in enriched
-        ],
+        "records": [{
+            "doc_num":      r.get("doc_num",""),
+            "doc_type":     r.get("doc_type",""),
+            "filed":        r.get("filed",""),
+            "cat":          r.get("cat",""),
+            "cat_label":    r.get("cat_label",""),
+            "owner":        r.get("owner",""),
+            "grantee":      r.get("grantee",""),
+            "amount":       r.get("amount"),
+            "legal":        r.get("legal",""),
+            "prop_address": r.get("prop_address",""),
+            "prop_city":    r.get("prop_city",""),
+            "prop_state":   r.get("prop_state","AZ"),
+            "prop_zip":     r.get("prop_zip",""),
+            "mail_address": r.get("mail_address",""),
+            "mail_city":    r.get("mail_city",""),
+            "mail_state":   r.get("mail_state","AZ"),
+            "mail_zip":     r.get("mail_zip",""),
+            "clerk_url":    r.get("clerk_url",""),
+            "flags":        r.get("flags",[]),
+            "score":        r.get("score",30),
+        } for r in enriched],
     }
 
-    # 5 — Save
-    for out in [DASHBOARD_DIR / "records.json", DATA_DIR / "records.json"]:
+    for out in [DASHBOARD_DIR/"records.json", DATA_DIR/"records.json"]:
         out.write_text(json.dumps(payload, indent=2), encoding="utf-8")
         log.info("Saved → %s", out)
 
-    ghl_path = DATA_DIR / "ghl_export.csv"
-    write_ghl_csv(payload["records"], ghl_path)
-    log.info("GHL CSV → %s", ghl_path)
-
-    log.info("Done. %d leads (%d with address)", payload["total"], with_address)
+    write_ghl_csv(payload["records"], DATA_DIR/"ghl_export.csv")
+    log.info("Done. %d leads (%d with address)", len(enriched), with_address)
 
 
 if __name__ == "__main__":
