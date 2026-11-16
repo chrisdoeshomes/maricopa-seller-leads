@@ -1,9 +1,9 @@
 {
-  "fetched_at": "2026-11-15T14:36:23.353971Z",
+  "fetched_at": "2026-11-16T16:51:59.994814Z",
   "source": "Maricopa County Superior Court",
   "date_range": {
-    "start": "2026-11-08",
-    "end": "2026-11-15"
+    "start": "2026-11-09",
+    "end": "2026-11-16"
   },
   "total": 0,
   "with_address": 0,
